@@ -12,16 +12,19 @@ podTemplate(
     containers: [
         containerTemplate(name: 'node', image: 'node:20-slim', ttyEnabled: true, command: 'cat'),
         containerTemplate(name: 'podman', image: "mgoltzsche/podman", ttyEnabled: true, command: 'cat', privileged: true),
+        containerTemplate(name: 'azure-cli', image: 'hiondal/azure-kubectl:latest', command: 'cat', ttyEnabled: true),
         containerTemplate(name: 'sonar-scanner', image: 'sonarsource/sonar-scanner-cli:latest', command: 'cat', ttyEnabled: true),
         containerTemplate(name: 'git', image: 'alpine/git:latest', command: 'cat', ttyEnabled: true)
     ],
     volumes: [
+        emptyDirVolume(mountPath: '/root/.azure', memory: false),
         emptyDirVolume(mountPath: '/opt/sonar-scanner/.sonar/cache', memory: false)
     ]
 ) {
     node(PIPELINE_ID) {
         def props
         def imageTag = getImageTag()
+        def namespace
         def sonarScannerHome = '/opt/sonar-scanner'
         def MANIFEST_REPO = "https://github.com/yuhalog/lifesub-manifest.git"
         def MANIFEST_BRANCH = "main"
@@ -29,19 +32,20 @@ podTemplate(
         stage("Get Source") {
             checkout scm
             props = readProperties file: "deployment/deploy_env_vars"
+            namespace = "${props.namespace}"
         }
 
         stage('Code Analysis & Quality Gate') {
             container('node') {
                 sh "npm install"
-                sh "npm test -- --coverage --passWithNoTests"
+                sh "npm test -- --coverage --passWithNoTests"   //test code 없어도 통과되게 함  
             }
             
             container('sonar-scanner') {
                 withSonarQubeEnv('SonarQube') {
                     sh """
                         ${sonarScannerHome}/bin/sonar-scanner \
-                        -Dsonar.projectKey=lifesub-web-${props.teamid} \
+                        -Dsonar.projectKey=lifesub-web-lifesub-web-dg0410 \
                         -Dsonar.sources=src \
                         -Dsonar.tests=src \
                         -Dsonar.test.inclusions=src/**/*.test.js,src/**/*.test.jsx \
@@ -54,6 +58,18 @@ podTemplate(
                 def qg = waitForQualityGate()
                 if (qg.status != 'OK') {
                     error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+            }
+        }
+
+        stage("Setup AKS") {
+            container('azure-cli') {
+                withCredentials([azureServicePrincipal('azure-credentials')]) {
+                    sh """
+                        az login --service-principal -u \$AZURE_CLIENT_ID -p \$AZURE_CLIENT_SECRET -t \$AZURE_TENANT_ID
+                        az aks get-credentials --resource-group rg-digitalgarage-02 --name aks-digitalgarage-02 --overwrite-existing
+                        kubectl create namespace ${namespace} --dry-run=client -o yaml | kubectl apply -f -
+                    """
                 }
             }
         }
@@ -103,7 +119,6 @@ podTemplate(
                         # Update frontend image tag
                         if [ -f lifesub-web/lifesub-web-deployment.yaml ]; then
                             sed -i "s|image: ${props.registry}/${props.image_org}/lifesub-web:.*|image: ${props.registry}/${props.image_org}/lifesub-web:${imageTag}|g" lifesub-web/lifesub-web-deployment.yaml
-                            echo "Updated lifesub-web image tag to ${imageTag}"
                         fi
                         
                         # Commit and push changes
